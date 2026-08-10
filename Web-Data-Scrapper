@@ -34,11 +34,11 @@ SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
 TAB_NAME = "Kahramanmaras_Teknokent"
 
-BASE_URL = "https://teknokentmaras.com"
-LIST_URL = "https://teknokentmaras.com/tr/Companies"
-CITY = "Kahramanmaraş"
-OSB_NAME = "Kahramanmaraş Teknokent"
-DEFAULT_ADDRESS = "Kahramanmaraş Sütçü İmam Üniversitesi Avşar Kampüsü Teknokent, Kahramanmaraş"
+BASE_URL = "URL"
+LIST_URL = "URL"
+CITY = "CİTY"
+OSB_NAME = "NAME"
+DEFAULT_ADDRESS = "ADDRESS"
 
 REQUEST_TIMEOUT = 15
 PAGE_LOAD_TIMEOUT = 35
