@@ -1,0 +1,621 @@
+import hashlib
+import html as html_lib
+import json
+import os
+import random
+import re
+import time
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from bs4 import BeautifulSoup, Tag
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:
+    webdriver = None
+    TimeoutException = WebDriverException = Exception
+    Options = None
+    WebDriverWait = None
+
+
+SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
+TAB_NAME = "Kahramanmaras_Teknokent"
+
+BASE_URL = "https://teknokentmaras.com"
+LIST_URL = "https://teknokentmaras.com/tr/Companies"
+CITY = "Kahramanmaraş"
+OSB_NAME = "Kahramanmaraş Teknokent"
+DEFAULT_ADDRESS = "Kahramanmaraş Sütçü İmam Üniversitesi Avşar Kampüsü Teknokent, Kahramanmaraş"
+
+REQUEST_TIMEOUT = 15
+PAGE_LOAD_TIMEOUT = 35
+MAX_CONTACT_PAGES = 3
+USE_SELENIUM_FALLBACK = True
+HEADLESS = False
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/150.0.0.0 Safari/537.36"
+)
+
+SHEET_HEADER = [
+    "city", "osb_name", "sector", "company_name", "address", "phone",
+    "fax", "website", "email", "activity_subject", "profile_url", "company_id"
+]
+
+GENERIC_EMAIL_DOMAINS = {
+    "teknokentmaras.com", "facebook.com", "instagram.com", "youtube.com", "x.com",
+    "twitter.com", "example.com", "wixpress.com", "sentry.io", "linkedin.com"
+}
+
+
+def clean_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = html_lib.unescape(text).replace("\xa0", " ").replace("\u00ad", "")
+    return re.sub(r"\s+", " ", text).strip(" -|\t\r\n")
+
+
+def normalize_name(value: str) -> str:
+    return clean_text(value).upper().strip(" .")
+
+
+def name_key(value: str) -> str:
+    value = normalize_name(value)
+    value = value.translate(str.maketrans("ÇĞİÖŞÜ", "CGIOSU"))
+    return re.sub(r"[^A-Z0-9]+", "", value)
+
+
+def normalize_url(value: str, base_url: str = "") -> str:
+    value = clean_text(value).strip(" ,;#")
+    if not value or value.lower().startswith(("mailto:", "tel:", "javascript:")) or "cdn-cgi" in value.lower():
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    elif value.startswith("www."):
+        value = "https://" + value
+    value = urljoin(base_url, value)
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
+
+
+def registered_host(url: str) -> str:
+    host = urlparse(url).netloc.lower().split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def make_company_id(company_name: str, website: str) -> str:
+    key = f"{name_key(company_name)}|{registered_host(website)}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:18]
+    return f"maras:{digest}"
+
+
+def valid_email(value: str) -> str:
+    value = clean_text(value).replace("[at]", "@").replace("(at)", "@")
+    match = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", value, flags=re.I)
+    if not match:
+        return ""
+    email = match.group(0).lower().strip(".,;:/ ")
+    domain = email.rsplit("@", 1)[-1]
+    if domain in GENERIC_EMAIL_DOMAINS or email.endswith((".png", ".jpg", ".webp")):
+        return ""
+    return email
+
+
+def all_emails(value: str) -> list[str]:
+    emails = []
+    for match in re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", value, flags=re.I):
+        email = valid_email(match)
+        if email and email not in emails:
+            emails.append(email)
+    return emails
+
+
+def normalize_phone(value: str) -> str:
+    value = clean_text(value)
+    digits = re.sub(r"\D", "", value)
+    if digits.startswith("0090"):
+        digits = digits[2:]
+    if len(digits) < 7 or len(digits) > 15:
+        return ""
+    return value.strip(".,;: ")
+
+
+def phone_candidates(text: str) -> list[str]:
+    patterns = [
+        r"(?:\+?90\s*)?(?:\(?0?\d{3}\)?[\s./-]*)\d{3}[\s./-]*\d{2}[\s./-]*\d{2}",
+        r"(?:\+?90\s*)?\(?0?\d{3}\)?[\s./-]*\d{3}[\s./-]*\d{4}",
+        r"\b\d{7,11}\b",
+    ]
+    result = []
+    for pattern in patterns:
+        for raw in re.findall(pattern, text):
+            phone = normalize_phone(raw)
+            if phone and phone not in result:
+                result.append(phone)
+    return result
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    return session
+
+
+def request_html(session: requests.Session, url: str) -> tuple[str, str]:
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, verify=False)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or "utf-8"
+            if len(response.text) < 500:
+                raise RuntimeError("unexpectedly short HTML")
+            return response.text, response.url
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep((2 ** attempt) + random.uniform(0.2, 0.8))
+    raise RuntimeError(f"Could not open {url}: {last_error}")
+
+
+def build_driver():
+    if webdriver is None or Options is None:
+        return None
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+        
+    options.page_load_strategy = 'eager'  
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--window-size=1500,1000")
+    options.add_argument(f"--user-agent={USER_AGENT}")
+    
+    prefs = {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    }
+    options.add_experimental_option("prefs", prefs)
+    driver = webdriver.Chrome(options=options)
+    
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {
+              get: () => undefined
+            })
+        """
+    })
+    
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
+
+
+def selenium_html(driver, url: str) -> tuple[str, str]:
+    if driver is None:
+        raise RuntimeError("Selenium is not available")
+    try:
+        driver.get(url)
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+    time.sleep(3.0)
+    return driver.page_source, driver.current_url
+
+
+def extract_company_cards(html: str, source_url: str) -> list[dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    records: list[dict[str, str]] = []
+    unique_keys = set()
+
+    for card in soup.find_all("div", class_=lambda c: c and "company-card" in c):
+        text_content = card.get_text(" ", strip=True)
+
+        company_name = ""
+        sector = "Teknoloji / Ar-Ge"
+
+        header_div = card.find("div", class_=lambda c: c and "align-items-start" in c)
+        if header_div:
+            lines = [clean_text(line) for line in header_div.get_text("\n").split("\n") if clean_text(line)]
+            if lines:
+                company_name = lines[0]
+            if len(lines) >= 2:
+                sector = lines[1]
+        else:
+            title_el = card.find(["h3", "h4", "h5", "h6", "strong", "b"])
+            if title_el:
+                company_name = clean_text(title_el.get_text())
+
+        if not company_name or len(company_name) < 2:
+            continue
+
+        website = ""
+        for a in card.find_all("a", href=True):
+            h = a["href"]
+            h_lower = h.lower()
+            if h.startswith("http") and "teknokentmaras.com" not in h_lower and "facebook" not in h_lower and "linkedin" not in h_lower and "instagram" not in h_lower:
+                website = normalize_url(h, source_url)
+                break
+
+        emails = []
+        for a in card.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().startswith("mailto:"):
+                e = valid_email(href.split(":", 1)[1].split("?", 1)[0])
+                if e and e not in emails:
+                    emails.append(e)
+
+        for e in all_emails(text_content):
+            if e not in emails:
+                emails.append(e)
+
+        email = emails[0] if emails else ""
+        phones = phone_candidates(text_content)
+        phone = phones[0] if phones else ""
+
+        key = f"{name_key(company_name)}|{registered_host(website)}"
+        if key in unique_keys:
+            continue
+        unique_keys.add(key)
+
+        records.append({
+            "company_name": company_name,
+            "website": website,
+            "email": email,
+            "phone": phone,
+            "sector": sector,
+        })
+
+    return records
+
+
+def visible_text(soup: BeautifulSoup) -> str:
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    return clean_text(soup.get_text("\n", strip=True))
+
+
+def extract_contact_from_html(html: str, page_url: str) -> dict[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+    text = visible_text(BeautifulSoup(html, "html.parser"))
+
+    emails: list[str] = []
+    phones: list[str] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = clean_text(anchor.get("href", ""))
+        if href.lower().startswith("mailto:"):
+            email = valid_email(href.split(":", 1)[1].split("?", 1)[0])
+            if email and email not in emails:
+                emails.append(email)
+        elif href.lower().startswith("tel:"):
+            phone = normalize_phone(href.split(":", 1)[1])
+            if phone and phone not in phones:
+                phones.append(phone)
+
+    for email in all_emails(html_lib.unescape(html)) + all_emails(text):
+        if email not in emails:
+            emails.append(email)
+
+    for phone in phone_candidates(text):
+        if phone not in phones:
+            phones.append(phone)
+
+    return {
+        "email": emails[0] if emails else "",
+        "phone": phones[0] if phones else "",
+    }
+
+
+def contact_page_urls(html: str, page_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    host = registered_host(page_url)
+    candidates: list[tuple[int, str]] = []
+    for anchor in soup.find_all("a", href=True):
+        href = normalize_url(anchor.get("href", ""), page_url)
+        if not href or registered_host(href) != host:
+            continue
+        text = clean_text(anchor.get_text(" ", strip=True)).casefold()
+        haystack = f"{href.casefold()} {text}"
+        score = 0
+        if any(term in haystack for term in ("iletisim", "iletişim", "contact", "bize-ulasin", "bize ulaş")):
+            score = 100
+        elif any(term in haystack for term in ("kurumsal", "about", "firma", "company")):
+            score = 30
+        if score:
+            candidates.append((score, href))
+
+    result: list[str] = []
+    for _, href in sorted(candidates, key=lambda x: (-x[0], len(x[1]))):
+        if href not in result and href.rstrip("/") != page_url.rstrip("/"):
+            result.append(href)
+        if len(result) >= MAX_CONTACT_PAGES:
+            break
+    return result
+
+
+def merge_contact(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+    merged = dict(base)
+    for key in ("email", "phone"):
+        if not merged.get(key) and extra.get(key):
+            merged[key] = extra[key]
+    return merged
+
+
+def scrape_company_site(session: requests.Session, driver, website: str) -> dict[str, str]:
+    empty = {"email": "", "phone": "", "source_url": website}
+    if not website:
+        return empty
+
+    html = ""
+    final_url = website
+    try:
+        html, final_url = request_html(session, website)
+    except Exception:
+        if USE_SELENIUM_FALLBACK and driver is not None:
+            try:
+                html, final_url = selenium_html(driver, website)
+            except Exception:
+                return empty
+        else:
+            return empty
+
+    result = extract_contact_from_html(html, final_url)
+    page_candidates = contact_page_urls(html, final_url)
+
+    for contact_url in page_candidates:
+        if result.get("email") and result.get("phone"):
+            break
+        try:
+            contact_html, contact_final = request_html(session, contact_url)
+        except Exception:
+            if USE_SELENIUM_FALLBACK and driver is not None:
+                try:
+                    contact_html, contact_final = selenium_html(driver, contact_url)
+                except Exception:
+                    continue
+            else:
+                continue
+        result = merge_contact(result, extract_contact_from_html(contact_html, contact_final))
+        time.sleep(random.uniform(0.2, 0.4))
+
+    return result
+
+
+def scrape_all() -> list[dict[str, str]]:
+    session = build_session()
+    driver = None
+    if USE_SELENIUM_FALLBACK:
+        try:
+            driver = build_driver()
+        except Exception as exc:
+            print(f"Selenium fallback could not start: {exc}")
+
+    print(f"\nOpening Kahramanmaraş Teknokent firmalar listesi: {LIST_URL}")
+    try:
+        if driver:
+            driver.get(LIST_URL)
+            time.sleep(4)
+            last_height = driver.execute_script("return document.body.scrollHeight")
+            for _ in range(8):
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    break
+                last_height = new_height
+            list_html = driver.page_source
+            final_list_url = driver.current_url
+        else:
+            list_html, final_list_url = request_html(session, LIST_URL)
+    except Exception as exc:
+        print(f"Liste sayfası açılırken hata oluştu: {exc}")
+        if driver:
+            driver.quit()
+        return []
+
+    cards = extract_company_cards(list_html, final_list_url)
+    print(f"\n=> Toplam bulunan firma sayısı: {len(cards)}\n")
+
+    records: list[dict[str, str]] = []
+    try:
+        for index, card in enumerate(cards, start=1):
+            company_name = card["company_name"]
+            website = card["website"]
+            email = card["email"]
+            phone = card["phone"]
+            sector = card["sector"]
+
+            print(f"[{index}/{len(cards)}] İşleniyor: {company_name}")
+            print(f"   -> Web: {website} | Email: {email} | Tel: {phone}")
+
+            if website and (not email or not phone):
+                site_contact = scrape_company_site(session, driver, website)
+                if not email and site_contact.get("email"):
+                    email = site_contact.get("email")
+                if not phone and site_contact.get("phone"):
+                    phone = site_contact.get("phone")
+
+            record = {
+                "city": CITY,
+                "osb_name": OSB_NAME,
+                "sector": sector,
+                "company_name": company_name,
+                "address": DEFAULT_ADDRESS,
+                "phone": phone,
+                "fax": "",
+                "website": website,
+                "email": email,
+                "activity_subject": sector,
+                "profile_url": LIST_URL,
+                "company_id": make_company_id(company_name, website or LIST_URL),
+            }
+            records.append(record)
+            time.sleep(random.uniform(0.3, 0.6))
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    unique = {record["company_id"]: record for record in records}
+    result = list(unique.values())
+    print(f"\nFinal data ready for {len(result)} companies.")
+    return result
+
+
+def sheets_client():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            f"Service account dosyası bulunamadı: '{SERVICE_ACCOUNT_FILE}'. "
+            "Lütfen kimlik bilgisini 'credentials.json' adıyla proje dizinine koyun veya "
+            "GOOGLE_APPLICATION_CREDENTIALS çevre değişkenini tanımlayın."
+        )
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=credentials)
+
+
+def ensure_tab_exists(service) -> None:
+    spreadsheet = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="sheets.properties",
+    ).execute()
+    titles = {sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])}
+    if TAB_NAME not in titles:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": TAB_NAME}}}]},
+        ).execute()
+        print(f"Created Google Sheets tab: {TAB_NAME}")
+
+
+def ensure_header(service) -> None:
+    ensure_tab_exists(service)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TAB_NAME}!A1:L1",
+    ).execute()
+    values = result.get("values", [])
+    if not values:
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{TAB_NAME}!A1",
+            valueInputOption="RAW",
+            body={"values": [SHEET_HEADER]},
+        ).execute()
+        return
+    current = [clean_text(value).casefold() for value in values[0]]
+    expected = [value.casefold() for value in SHEET_HEADER]
+    if current != expected:
+        raise RuntimeError(f"Header mismatch in {TAB_NAME}. Existing: {values[0]} Expected: {SHEET_HEADER}")
+
+
+def read_existing_rows(service) -> dict[str, int]:
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{TAB_NAME}!A:L",
+    ).execute()
+    values = result.get("values", [])
+    if not values:
+        return {}
+    header = [clean_text(value).casefold() for value in values[0]]
+    id_index = header.index("company_id")
+    rows = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        if len(row) > id_index and clean_text(row[id_index]):
+            rows[clean_text(row[id_index])] = row_number
+    return rows
+
+
+def record_to_row(record: dict[str, str]) -> list[str]:
+    return [record.get(key, "") for key in SHEET_HEADER]
+
+
+def write_records(service, records: list[dict[str, str]]) -> tuple[int, int]:
+    existing = read_existing_rows(service)
+    updates = []
+    additions = []
+    for record in records:
+        row = record_to_row(record)
+        row_number = existing.get(record["company_id"])
+        if row_number:
+            updates.append((row_number, row))
+        else:
+            additions.append(row)
+
+    for start in range(0, len(updates), 250):
+        batch = updates[start:start + 250]
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={
+                "valueInputOption": "RAW",
+                "data": [
+                    {"range": f"{TAB_NAME}!A{row_number}:L{row_number}", "values": [row]}
+                    for row_number, row in batch
+                ],
+            },
+        ).execute()
+
+    for start in range(0, len(additions), 500):
+        batch = additions[start:start + 500]
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{TAB_NAME}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": batch},
+        ).execute()
+    return len(updates), len(additions)
+
+
+def main() -> None:
+    records = scrape_all()
+    if not records:
+        print("Hiç kayıt bulunamadı.")
+        return
+    service = sheets_client()
+    ensure_header(service)
+    updated, added = write_records(service, records)
+    print("-" * 60)
+    print(f"Unique companies prepared: {len(records)}")
+    print(f"Rows updated: {updated}")
+    print(f"Rows added: {added}")
+    print(f"Google Sheets tab: {TAB_NAME}")
+
+
+if __name__ == "__main__":
+    main()
